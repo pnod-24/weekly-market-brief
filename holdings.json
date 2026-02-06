@@ -1,0 +1,4 @@
+{
+  "tickers": ["AAPL", "MSFT", "NVDA"],
+  "indices": ["SPY", "QQQ", "DIA", "VIXY"]
+}
