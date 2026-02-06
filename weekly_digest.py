@@ -6,9 +6,10 @@ from datetime import datetime, timezone
 
 import requests
 import feedparser
+from openai import OpenAI
 
-USE_OPENAI = bool(os.getenv("OPENAI_API_KEY"))  # not used in this simple version, but kept
 
+# -------- Helpers --------
 
 def read_holdings():
     with open("holdings.json", "r", encoding="utf-8") as f:
@@ -17,15 +18,14 @@ def read_holdings():
 
 def get_with_retry(url, max_tries=6):
     """
-    Retry on Yahoo 429 rate limit with exponential backoff.
-    This is important on GitHub Actions because runner IPs are shared.
+    Retry on 429 rate limit (common on GitHub Actions shared IPs).
+    Uses exponential backoff + jitter.
     """
     last_exc = None
     for attempt in range(max_tries):
         try:
             r = requests.get(url, timeout=20)
             if r.status_code == 429:
-                # Exponential backoff + jitter
                 sleep_s = (2 ** attempt) + random.uniform(0.5, 1.5)
                 time.sleep(sleep_s)
                 continue
@@ -40,12 +40,12 @@ def get_with_retry(url, max_tries=6):
 
 def yf_quotes(symbols):
     """
-    Fetch ALL symbols in ONE request to reduce rate limiting.
-    Returns a dict: { "AAPL": {price, change_pct...}, ... }
+    Fetch ALL symbols in ONE Yahoo request to reduce rate limiting.
+    Returns dict: { "AAPL": {price, change_pct, ...}, ... }
     """
     # Remove duplicates while preserving order
     seen = set()
-    symbols = [s for s in symbols if not (s in seen or seen.add(s))]
+    symbols = [s for s in symbols if s and not (s in seen or seen.add(s))]
 
     joined = ",".join(symbols)
     url = f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={joined}"
@@ -58,6 +58,7 @@ def yf_quotes(symbols):
         sym = q.get("symbol")
         out[sym] = {
             "symbol": sym,
+            "name": q.get("shortName") or q.get("longName") or sym,
             "price": q.get("regularMarketPrice"),
             "change": q.get("regularMarketChange"),
             "change_pct": q.get("regularMarketChangePercent"),
@@ -68,9 +69,10 @@ def yf_quotes(symbols):
 
 def news_for(ticker, limit=3):
     """
-    Google News RSS headlines (no API key needed).
+    Google News RSS headlines (no API key).
     """
-    rss = f"https://news.google.com/rss/search?q={requests.utils.quote(ticker + ' stock')}&hl=en-US&gl=US&ceid=US:en"
+    q = requests.utils.quote(f"{ticker} stock")
+    rss = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
     feed = feedparser.parse(rss)
     titles = []
     for e in feed.entries[:limit]:
@@ -93,51 +95,83 @@ def send_telegram(text):
         "text": text,
         "disable_web_page_preview": True
     }
-
     r = requests.post(url, json=payload, timeout=20)
     r.raise_for_status()
 
 
 def fmt_line(sym, q):
-    """
-    Format a single quote line safely.
-    """
     if not q:
         return f"- {sym}: (no data)"
-
     price = q.get("price")
     cpct = q.get("change_pct")
     cur = q.get("currency") or ""
-
     if price is None or cpct is None:
         return f"- {sym}: (no data)"
-
-    # Keep it simple; Yahoo already returns numeric
     return f"- {sym}: {price} {cur} ({cpct:+.2f}%)"
 
+
+def ai_summarize(raw_text):
+    """
+    Produce a short weekly brief using OpenAI if OPENAI_API_KEY exists.
+    Falls back to raw_text if key is missing or API fails.
+    """
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None  # signal: no AI
+
+    try:
+        client = OpenAI(api_key=api_key)
+
+        instructions = (
+            "You are a weekly market brief assistant.\n"
+            "Summarize the user's portfolio + market pulse based ONLY on the provided text.\n"
+            "Rules:\n"
+            "- Keep it under ~1200 characters.\n"
+            "- Use 6–10 bullets.\n"
+            "- Structure:\n"
+            "  1) Market pulse (1–2 bullets)\n"
+            "  2) Biggest movers in my tickers (2–4 bullets)\n"
+            "  3) What to watch next week (2–3 bullets)\n"
+            "- No financial advice. No buy/sell language.\n"
+            "- Plain English.\n"
+        )
+
+        resp = client.responses.create(
+            model="gpt-5.2",
+            input=raw_text,
+            instructions=instructions
+        )
+        text = (resp.output_text or "").strip()
+        return text if text else None
+    except Exception:
+        return None
+
+
+# -------- Main --------
 
 def main():
     data = read_holdings()
     tickers = data.get("tickers", [])
     indices = data.get("indices", [])
-
-    # Build one combined list for ONE Yahoo call
     all_symbols = tickers + indices
+
+    now_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     lines = []
     lines.append("📊 Weekly Market & Economy Update")
-    lines.append(datetime.now(timezone.utc).strftime("Generated %Y-%m-%d %H:%M UTC"))
+    lines.append(f"🕒 Generated: {now_utc}")
     lines.append("")
 
-    # 1) Quotes (safe: do not crash everything if Yahoo fails)
+    # Quotes (safe fallback)
     quotes = {}
-    yahoo_error = None
+    yahoo_failed = False
     try:
         quotes = yf_quotes(all_symbols)
-    except Exception as e:
-        yahoo_error = str(e)
+    except Exception:
+        yahoo_failed = True
+        quotes = {}
 
-    # 2) Your stocks section
+    # Your stocks
     lines.append("💼 Your Stocks")
     if not tickers:
         lines.append("- (no tickers in holdings.json)")
@@ -153,7 +187,7 @@ def main():
         for i in indices:
             lines.append(fmt_line(i, quotes.get(i)))
 
-    # 3) Headlines (safe: don’t crash on RSS errors)
+    # Headlines
     lines.append("")
     lines.append("📰 Headlines")
     if not tickers:
@@ -161,26 +195,44 @@ def main():
     else:
         for t in tickers:
             try:
-                headlines = news_for(t, limit=3)
-                if not headlines:
+                hs = news_for(t, limit=3)
+                if not hs:
                     lines.append(f"- {t}: (no headlines found)")
                 else:
-                    for h in headlines:
+                    for h in hs:
                         lines.append(f"- {t}: {h}")
             except Exception:
                 lines.append(f"- {t}: (news fetch failed)")
 
-    # 4) If Yahoo failed, add a short note (don’t crash)
-    if yahoo_error:
+    if yahoo_failed:
         lines.append("")
-        lines.append("⚠️ Note: Price data fetch hit an error (rate-limit or network).")
-        lines.append("    Headlines still sent. Next run should recover automatically.")
+        lines.append("⚠️ Note: price data fetch failed (rate-limit/network). Headlines still included.")
 
-    # Telegram message limit exists; keep safe
-    msg = "\n".join(lines)
-    msg = msg[:3800]
+    raw_msg = "\n".join(lines)
+    raw_msg = raw_msg[:3800]  # keep bounded for Telegram + OpenAI input
 
-    send_telegram(msg)
+    # AI Summary (optional)
+    summary = ai_summarize(raw_msg)
+
+    if summary:
+        # One message: summary first, then a shorter details block
+        details = raw_msg
+        # Keep details shorter so total stays within Telegram limits comfortably
+        details = details[:2000]
+
+        final_msg = (
+            "🧠 AI Weekly Brief\n"
+            f"{summary}\n\n"
+            "—\n"
+            "📌 Details\n"
+            f"{details}"
+        )
+    else:
+        # No AI key or AI failed -> send raw
+        final_msg = raw_msg + "\n\nTip: Add OPENAI_API_KEY secret to enable AI summary."
+
+    final_msg = final_msg[:3800]
+    send_telegram(final_msg)
 
 
 if __name__ == "__main__":
