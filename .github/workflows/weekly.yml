@@ -23,6 +23,14 @@ jobs:
         run: |
           pip install -r requirements.txt
 
+      - name: Check secrets exist (safe)
+        run: |
+          if [ -z "${TELEGRAM_BOT_TOKEN}" ]; then echo "TELEGRAM_BOT_TOKEN=EMPTY"; else echo "TELEGRAM_BOT_TOKEN=SET"; fi
+          if [ -z "${TELEGRAM_CHAT_ID}" ]; then echo "TELEGRAM_CHAT_ID=EMPTY"; else echo "TELEGRAM_CHAT_ID=SET"; fi
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+
       - name: Run bot
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
